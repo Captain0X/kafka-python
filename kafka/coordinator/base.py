@@ -82,6 +82,8 @@ class BaseCoordinator(object):
 
     DEFAULT_CONFIG = {
         'group_id': 'kafka-python-default-group',
+         'group_instance_id': '',
+        'leave_group_on_close': None,
         'session_timeout_ms': 10000,
         'heartbeat_interval_ms': 3000,
         'max_poll_interval_ms': 300000,
@@ -96,6 +98,12 @@ class BaseCoordinator(object):
             group_id (str): name of the consumer group to join for dynamic
                 partition assignment (if enabled), and to use for fetching and
                 committing offsets. Default: 'kafka-python-default-group'
+            group_instance_id (str): the unique identifier to distinguish
+                each client instance. If set and leave_group_on_close is
+                False consumer group rebalancing won't be triggered until
+                sessiont_timeout_ms is met. Requires 2.3.0+.
+            leave_group_on_close (bool or None): whether to leave a consumer
+                 group or not on consumer shutdown.
             session_timeout_ms (int): The timeout used to detect failures when
                 using Kafka's group management facilities. Default: 30000
             heartbeat_interval_ms (int): The expected time in milliseconds
@@ -120,6 +128,10 @@ class BaseCoordinator(object):
                 raise Errors.KafkaConfigurationError("Broker version %s does not support "
                                                      "different values for max_poll_interval_ms "
                                                      "and session_timeout_ms")
+        if self.config['group_instance_id'] and self.config['api_version'] < (2, 3, 0):
+            raise Errors.KafkaConfigurationError(
+                'Broker version %s does not support static membership' % (self.config['api_version'],),
+            )
 
         self._client = client
         self.group_id = self.config['group_id']
@@ -429,63 +441,82 @@ class BaseCoordinator(object):
         return self.join_future is not None
 
     def _send_join_group_request(self):
-        """Join the group and return the assignment for the next generation.
+    """Join the group and return the assignment for the next generation.
 
-        This function handles both JoinGroup and SyncGroup, delegating to
-        :meth:`._perform_assignment` if elected leader by the coordinator.
+    This function handles both JoinGroup and SyncGroup, delegating to
+    :meth:`._perform_assignment` if elected leader by the coordinator.
 
-        Returns:
-            Future: resolves to the encoded-bytes assignment returned from the
-                group leader
-        """
-        if self.coordinator_unknown():
-            e = Errors.GroupCoordinatorNotAvailableError(self.coordinator_id)
-            return Future().failure(e)
+    Returns:
+        Future: resolves to the encoded-bytes assignment returned from the
+            group leader
+    """
+    if self.coordinator_unknown():
+        e = Errors.GroupCoordinatorNotAvailableError(self.coordinator_id)
+        return Future().failure(e)
 
-        elif not self._client.ready(self.coordinator_id, metadata_priority=False):
-            e = Errors.NodeNotReadyError(self.coordinator_id)
-            return Future().failure(e)
+    elif not self._client.ready(self.coordinator_id, metadata_priority=False):
+        e = Errors.NodeNotReadyError(self.coordinator_id)
+        return Future().failure(e)
 
-        # send a join group request to the coordinator
-        log.info("(Re-)joining group %s", self.group_id)
-        member_metadata = [
-            (protocol, metadata if isinstance(metadata, bytes) else metadata.encode())
-            for protocol, metadata in self.group_protocols()
-        ]
-        if self.config['api_version'] < (0, 9):
-            raise Errors.KafkaError('JoinGroupRequest api requires 0.9+ brokers')
-        elif (0, 9) <= self.config['api_version'] < (0, 10, 1):
-            request = JoinGroupRequest[0](
-                self.group_id,
-                self.config['session_timeout_ms'],
-                self._generation.member_id,
-                self.protocol_type(),
-                member_metadata)
-        elif (0, 10, 1) <= self.config['api_version'] < (0, 11, 0):
-            request = JoinGroupRequest[1](
-                self.group_id,
-                self.config['session_timeout_ms'],
-                self.config['max_poll_interval_ms'],
-                self._generation.member_id,
-                self.protocol_type(),
-                member_metadata)
-        else:
-            request = JoinGroupRequest[2](
-                self.group_id,
-                self.config['session_timeout_ms'],
-                self.config['max_poll_interval_ms'],
-                self._generation.member_id,
-                self.protocol_type(),
-                member_metadata)
+    # send a join group request to the coordinator
+    log.info("(Re-)joining group %s", self.group_id)
+    member_metadata = [
+        (protocol, metadata if isinstance(metadata, bytes) else metadata.encode())
+        for protocol, metadata in self.group_protocols()
+    ]
+    if self.config['api_version'] < (0, 9):
+        raise Errors.KafkaError('JoinGroupRequest api requires 0.9+ brokers')
+    elif (0, 9) <= self.config['api_version'] < (0, 10, 1):
+        version = 0
+        args = (
+            self.group_id,
+            self.config['session_timeout_ms'],
+            self._generation.member_id,
+            self.protocol_type(),
+            member_metadata,
+        )
+    elif (0, 10, 1) <= self.config['api_version'] < (0, 11, 0):
+        version = 1
+        args = (
+            self.group_id,
+            self.config['session_timeout_ms'],
+            self.config['max_poll_interval_ms'],
+            self._generation.member_id,
+            self.protocol_type(),
+            member_metadata,
+        )
+    elif self.config['api_version'] >= (2, 3, 0) and self.config['group_instance_id']:
+        version = 5
+        args = (
+            self.group_id,
+            self.config['session_timeout_ms'],
+            self.config['max_poll_interval_ms'],
+            self._generation.member_id,
+            self.config['group_instance_id'],
+            self.protocol_type(),
+            member_metadata,
+        )
+    else:
+        version = 2
+        args = (
+            self.group_id,
+            self.config['session_timeout_ms'],
+            self.config['max_poll_interval_ms'],
+            self._generation.member_id,
+            self.protocol_type(),
+            member_metadata,
+        )
 
-        # create the request for the coordinator
-        log.debug("Sending JoinGroup (%s) to coordinator %s", request, self.coordinator_id)
-        future = Future()
-        _f = self._client.send(self.coordinator_id, request)
-        _f.add_callback(self._handle_join_group_response, future, time.time())
-        _f.add_errback(self._failed_request, self.coordinator_id,
-                       request, future)
-        return future
+    # create the request for the coordinator
+    request = JoinGroupRequest[version](*args)
+    log.debug("Sending JoinGroup (%s) to coordinator %s", request, self.coordinator_id)
+    future = Future()
+    _f = self._client.send(self.coordinator_id, request)
+    _f.add_callback(self._handle_join_group_response, future, time.time())
+    _f.add_errback(self._failed_request, self.coordinator_id,
+                   request, future)
+    return future
+
 
     def _failed_request(self, node_id, request, future, error):
         # Marking coordinator dead
@@ -562,15 +593,29 @@ class BaseCoordinator(object):
 
     def _on_join_follower(self):
         # send follower's sync group with an empty assignment
-        version = 0 if self.config['api_version'] < (0, 11, 0) else 1
-        request = SyncGroupRequest[version](
-            self.group_id,
-            self._generation.generation_id,
-            self._generation.member_id,
-            {})
+        if self.config['api_version'] >= (2, 3, 0) and self.config['group_instance_id']:
+            version = 3
+            args = (
+                self.group_id,
+                self._generation.generation_id,
+                self._generation.member_id,
+                self.config['group_instance_id'],
+                {},
+            )
+        else:
+            version = 0 if self.config['api_version'] < (0, 11, 0) else 1
+            args = (
+                self.group_id,
+                self._generation.generation_id,
+                self._generation.member_id,
+                {},
+            )
+
+        request = SyncGroupRequest[version](*args)
         log.debug("Sending follower SyncGroup for group %s to coordinator %s: %s",
                   self.group_id, self.coordinator_id, request)
         return self._send_sync_group_request(request)
+
 
     def _on_join_leader(self, response):
         """
@@ -590,18 +635,34 @@ class BaseCoordinator(object):
         except Exception as e:
             return Future().failure(e)
 
-        version = 0 if self.config['api_version'] < (0, 11, 0) else 1
-        request = SyncGroupRequest[version](
-            self.group_id,
-            self._generation.generation_id,
-            self._generation.member_id,
-            [(member_id,
-              assignment if isinstance(assignment, bytes) else assignment.encode())
-             for member_id, assignment in six.iteritems(group_assignment)])
+        group_assignment = [
+            (member_id, assignment if isinstance(assignment, bytes) else assignment.encode())
+            for member_id, assignment in six.iteritems(group_assignment)
+        ]
 
+        if self.config['api_version'] >= (2, 3, 0) and self.config['group_instance_id']:
+            version = 3
+            args = (
+                self.group_id,
+                self._generation.generation_id,
+                self._generation.member_id,
+                self.config['group_instance_id'],
+                group_assignment,
+            )
+        else:
+            version = 0 if self.config['api_version'] < (0, 11, 0) else 1
+            args = (
+                self.group_id,
+                self._generation.generation_id,
+                self._generation.member_id,
+                group_assignment,
+            )
+
+        request = SyncGroupRequest[version](*args)
         log.debug("Sending leader SyncGroup for group %s to coordinator %s: %s",
                   self.group_id, self.coordinator_id, request)
         return self._send_sync_group_request(request)
+
 
     def _send_sync_group_request(self, request):
         if self.coordinator_unknown():
@@ -764,21 +825,29 @@ class BaseCoordinator(object):
     def maybe_leave_group(self):
         """Leave the current group and reset local generation/memberId."""
         with self._client._lock, self._lock:
-            if (not self.coordinator_unknown()
+            if (
+                not self.coordinator_unknown()
                 and self.state is not MemberState.UNJOINED
-                and self._generation is not Generation.NO_GENERATION):
-
+                and self._generation is not Generation.NO_GENERATION
+                and self._leave_group_on_close()
+            ):
                 # this is a minimal effort attempt to leave the group. we do not
                 # attempt any resending if the request fails or times out.
                 log.info('Leaving consumer group (%s).', self.group_id)
-                version = 0 if self.config['api_version'] < (0, 11, 0) else 1
-                request = LeaveGroupRequest[version](self.group_id, self._generation.member_id)
+                if self.config['api_version'] >= (2, 3, 0) and self.config['group_instance_id']:
+                    version = 3
+                    args = (self.group_id, [(self._generation.member_id, self.config['group_instance_id'])])
+                else:
+                    version = 0 if self.config['api_version'] < (0, 11, 0) else 1
+                    args = self.group_id, self._generation.member_id
+                request = LeaveGroupRequest[version](*args)
                 future = self._client.send(self.coordinator_id, request)
                 future.add_callback(self._handle_leave_group_response)
                 future.add_errback(log.error, "LeaveGroup request failed: %s")
                 self._client.poll(future=future)
 
             self.reset_generation()
+
 
     def _handle_leave_group_response(self, response):
         error_type = Errors.for_code(response.error_code)
@@ -799,10 +868,23 @@ class BaseCoordinator(object):
             e = Errors.NodeNotReadyError(self.coordinator_id)
             return Future().failure(e)
 
-        version = 0 if self.config['api_version'] < (0, 11, 0) else 1
-        request = HeartbeatRequest[version](self.group_id,
-                                            self._generation.generation_id,
-                                            self._generation.member_id)
+        if self.config['api_version'] >= (2, 3, 0) and self.config['group_instance_id']:
+            version = 2
+            args = (
+                self.group_id,
+                self._generation.generation_id,
+                self._generation.member_id,
+                self.config['group_instance_id'],
+            )
+        else:
+            version = 0 if self.config['api_version'] < (0, 11, 0) else 1
+            args = (
+                self.group_id,
+                self._generation.generation_id,
+                self._generation.member_id,
+            )
+
+        request = HeartbeatRequest[version](*args)
         log.debug("Heartbeat: %s[%s] %s", request.group, request.generation_id, request.member_id)  # pylint: disable-msg=no-member
         future = Future()
         _f = self._client.send(self.coordinator_id, request)
@@ -810,6 +892,7 @@ class BaseCoordinator(object):
         _f.add_errback(self._failed_request, self.coordinator_id,
                        request, future)
         return future
+
 
     def _handle_heartbeat_response(self, future, send_time, response):
         self.sensors.heartbeat_latency.record((time.time() - send_time) * 1000)
@@ -848,6 +931,8 @@ class BaseCoordinator(object):
             error = error_type()
             log.error("Heartbeat failed: Unhandled error: %s", error)
             future.failure(error)
+    def _leave_group_on_close(self):
+        return self.config['leave_group_on_close'] is None or self.config['leave_group_on_close']
 
 
 class GroupCoordinatorMetrics(object):
